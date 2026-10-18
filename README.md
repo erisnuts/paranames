@@ -144,3 +144,113 @@ ParaNames offers several options for customization:
 - Within [`recipes/dump.sh`](https://github.com/bltlab/paranames/blob/main/recipes/dump.sh), it is also possible to define languages to be excluded and whether entity types should be disambiguated. By default, no languages are excluded and no disambiguation is done.
 
 - After the pipeline completes, `<output_folder>` will contain one folder per language, inside of which is a TSV file containing the subset of names in that language. Combined TSVs with names in all languages are available in the `combined` folder.
+
+## Rebuild from the Wikidata content export (no MongoDB)
+
+This fork adds a second way to build the corpus. It reads the monthly Wikimedia
+"MediaWiki Content File Exports" of Wikidata
+(`https://dumps.wikimedia.org/other/mediawiki_content_current/wikidatawiki/<YYYY-MM-DD>/xml/bzip2/`,
+a set of `*.xml.bz2` parts and a `SHA256SUMS` file). Each part is streamed: it is
+never extracted to disk, and MongoDB is not used. The MongoDB pipeline above is
+unchanged.
+
+### Commands
+
+Run from the repository root (with `pip install -e .` done, and ICU for
+`script_standardization.py`; `xsv` is not needed for this path):
+
+```
+bash recipes/paranames_content_export.sh <parts_dir_or_url_base> <output_folder> <n_workers> [sha256sums]
+```
+
+- `<parts_dir_or_url_base>` is a local folder with the `*.xml.bz2` parts, or the
+  URL of the `xml/bzip2/` folder. With a URL, each worker downloads one part,
+  extracts it and deletes it. For a URL, `sha256sums` defaults to
+  `<url_base>/SHA256SUMS`; every part is checked against it.
+- Intermediate files go to `<output_folder>/intermediate` by default. A part
+  whose JSONL file exists and was extracted with the same `languages` selection
+  from the same part is skipped, so a rerun with the same arguments resumes. The
+  part is identified by its SHA-256 from `SHA256SUMS` when one is given, else by
+  the size and mtime of the local part. A part extracted with a different
+  selection, or from a different part file with the same name (another dump
+  date), is extracted again. These values are stored in
+  `<part>.jsonl.gz.meta.json`.
+- The run stops with a non-zero exit code when any part fails (download error,
+  SHA-256 mismatch, unreadable bzip2 or XML, invalid item JSON, or a part where
+  no item could be read), before `types` when the number of up-to-date JSONL
+  files differs from the number of parts, and in `dump` when no entity gets a
+  type. A part with no item pages only logs a warning.
+- Environment variables: `languages` (default `en`), `mul_fallback` (default `en`),
+  `should_keep_intermediate_files` (default `no`; when `no`, the intermediate
+  folder is deleted after a successful run), `intermediate_output_folder`,
+  `should_disambiguate_types` and `should_collapse_languages` (default `no`, as in
+  `recipes/dump.sh`), `PYTHON`.
+
+The steps are also available one by one in
+`paranames/io/wikidata_content_export.py`:
+
+```
+python paranames/io/wikidata_content_export.py extract -i <part.xml.bz2> -o <part.jsonl.gz> [--sha256sums SHA256SUMS] [--languages en]
+python paranames/io/wikidata_content_export.py types -i <jsonl_folder> -o <closures_folder>
+python paranames/io/wikidata_content_export.py dump -i <jsonl_folder> -c <closures_folder> -o <tsv_folder> [--languages en] [--mul-fallback en]
+```
+
+`dump` writes `PER.tsv`, `LOC.tsv`, `ORG.tsv` and `combined.tsv`, and `sitelinks.tsv` (`wikidata_id`, `site`) for the typed
+entities. After that, the recipe runs `postprocess.py`,
+`script_standardization.py` and `separate_by_language.py` with the same
+arguments as `recipes/dump.sh`. The closures and `sitelinks.tsv` are copied to
+`<output_folder>/extra_data/`.
+
+`combined.tsv` has the columns and header of the file that `recipes/dump.sh`
+gives to `postprocess.py`, with one header line, the type files in the order
+LOC, ORG, PER, LF line ends and Python `csv` minimal quoting. It replaces the
+`xsv cat rows | xsv fmt` step of `recipes/dump.sh`; it was not compared byte for
+byte with real `xsv` output.
+
+### Languages
+
+The default run is English only (`languages=en`). To request more languages,
+give a comma-separated list of Wikimedia language codes, or `all` for every
+language except the codes in `data/exclude_these_languages.txt` (as upstream):
+
+```
+languages=en,de,fr bash recipes/paranames_content_export.sh ...
+languages=all bash recipes/paranames_content_export.sh ...
+```
+
+The selection is applied in `extract` already, so the intermediate JSONL files
+keep only the selected labels plus `en` and `mul`. `dump` stops with an error
+when a JSONL file was extracted with a selection that does not cover the
+requested one; the recipe then extracts that part again.
+
+### Differences from ParaNames v2024.05.07.0
+
+- **`mul` labels.** Upstream requires an `en` label. Here, an entity with no
+  `en` label but a `mul` label uses the `mul` value as its English name (the
+  `eng` column) and gets an `en` row with that value. A `mul` label is never
+  output as a language row of its own. This is controlled by `mul_fallback`
+  (`--mul-fallback`, default `en`; an empty value turns it off; `all` is
+  rejected). Other languages can be added to that list, but no other language
+  uses `mul` by default.
+- **Subclass closure from the dump.** Upstream gets the subclasses of LOC
+  (`Q82794`) and ORG (`Q43229`) from a live WDQS query (`wdt:P279*`). Here they
+  are computed from the truthy P279 statements in the same export (preferred
+  rank if any preferred statement exists, else normal; never deprecated), so the
+  types match the dump date. PER is still `Q5` only.
+- **Entity filter with a language list.** Upstream, a run with a language list
+  selects entities that have a label in one of those languages. Here, every
+  entity needs an `en` label (or a `mul` label, see above), whatever the
+  selection.
+
+### License
+
+The readme of the content export says that its textual data is licensed under
+CC BY-SA 4.0. Wikidata's structured data is released under CC0. Both statements
+are given here; check which one applies to your use.
+
+### Resources
+
+Disk: about one part per worker (for a URL base), plus the per-part JSONL files
+and the TSV outputs, all under `<output_folder>/intermediate` by default (set
+`intermediate_output_folder` to put them elsewhere). If a run fails, this folder
+stays, so a rerun can resume. No full run has been measured yet.
