@@ -799,3 +799,113 @@ def test_language_sidecar(tmp_path, parts_dir):
         ],
     )
     assert r.exit_code == 0 and "up to date" in r.output
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2
+# ---------------------------------------------------------------------------
+
+
+def test_dump_fails_without_typed_entities(tmp_path):
+    parts = tmp_path / "parts"
+    parts.mkdir()
+    write_part(
+        parts / "classes.xml.bz2", [item_page(it, i) for i, it in enumerate(PART1, 1)]
+    )
+    jsonl = tmp_path / "j"
+    jsonl.mkdir()
+    ce.extract_part(str(parts / "classes.xml.bz2"), str(jsonl / "classes.jsonl.gz"))
+    ce.build_closures(str(jsonl), str(tmp_path / "c"))
+    r = CliRunner().invoke(
+        ce.cli,
+        [
+            "dump",
+            "-i",
+            str(jsonl),
+            "-c",
+            str(tmp_path / "c"),
+            "-o",
+            str(tmp_path / "o"),
+        ],
+    )
+    assert r.exit_code != 0
+    assert "No typed entities" in r.output
+    assert not (tmp_path / "o" / "combined.tsv").exists()
+
+
+def test_is_current_checks_part_identity(tmp_path, parts_dir):
+    part = parts_dir / "part-2.xml.bz2"
+    out = tmp_path / "part-2.jsonl.gz"
+    ce.extract_part(str(part), str(out))
+    old_digest = hashlib.sha256(part.read_bytes()).hexdigest()
+    meta = ce.read_meta(str(out))
+    assert meta["sha256"] == old_digest
+    assert meta["part_size"] == part.stat().st_size
+
+    assert ce.extract_is_current(str(out), "en", str(part))
+    old_sums = tmp_path / "OLD_SUMS"
+    old_sums.write_text(f"{old_digest}  part-2.xml.bz2\n")
+    assert ce.extract_is_current(str(out), "en", sha256sums=str(old_sums))
+
+    # same part name, new content (another dump date)
+    write_part(part, [item_page(it, i) for i, it in enumerate(PART2[:3], 1)])
+    new_sums = tmp_path / "NEW_SUMS"
+    new_sums.write_text(
+        f"{hashlib.sha256(part.read_bytes()).hexdigest()}  part-2.xml.bz2\n"
+    )
+    assert not ce.extract_is_current(str(out), "en", str(part))
+    assert not ce.extract_is_current(str(out), "en", sha256sums=str(new_sums))
+
+    r = CliRunner().invoke(
+        ce.cli, ["is-current", "-o", str(out), "-i", str(part), "--languages", "en"]
+    )
+    assert r.exit_code == 1
+
+
+@pytest.mark.skipif(not _icu_available(), reason="PyICU not installed")
+def test_recipe_reextracts_changed_part(tmp_path, parts_dir):
+    keep = {"should_keep_intermediate_files": "yes"}
+    _run_recipe(tmp_path, str(parts_dir), extra_env=keep)
+    part = parts_dir / "part-2.xml.bz2"
+    write_part(part, [item_page(it, i) for i, it in enumerate(PART2[:3], 1)])
+    out, result = _run_recipe(tmp_path, str(parts_dir), extra_env=keep)
+    assert result.stdout.count("up to date, skipping") == 1
+    assert "[extract part-2.xml.bz2]" in result.stderr
+    ids = {r["wikidata_id"] for r in read_tsv(out / "combined" / "paranames.tsv")}
+    assert "Q13" not in ids  # only in the old part-2
+
+
+def test_extract_warns_on_part_without_item_pages(tmp_path, capsys):
+    part = tmp_path / "props.xml.bz2"
+    write_part(part, OTHER_PAGES[:2])
+    out = tmp_path / "o.jsonl.gz"
+    stats = ce.extract_part(str(part), str(out))
+    assert stats["item_pages"] == 0
+    assert "WARNING: no item pages" in capsys.readouterr().err
+    assert out.exists()
+
+
+def test_extract_part_with_only_redirects_passes(tmp_path):
+    part = tmp_path / "redirects.xml.bz2"
+    write_part(
+        part,
+        [
+            page(
+                "Q1",
+                0,
+                "wikibase-item",
+                json.dumps({"entity": "Q1", "redirect": "Q2"}),
+                1,
+            ),
+            page(
+                "Q3",
+                0,
+                "wikibase-item",
+                json.dumps({"entity": "Q3", "redirect": "Q4"}),
+                2,
+            ),
+        ],
+    )
+    stats = ce.extract_part(str(part), str(tmp_path / "o.jsonl.gz"))
+    assert stats["item_pages"] == 2 and stats["skipped_redirect"] == 2
+    assert stats["items_written"] == 0

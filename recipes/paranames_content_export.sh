@@ -87,13 +87,26 @@ case "${sha256sums}" in
 esac
 
 ## Step 1: extract every part (one part per worker)
+
+# Exit 0 when the JSONL of part $1 is up to date: same language selection and
+# same part (SHA-256 from SHA256SUMS when given, else size and mtime of the
+# local part).
+part_is_current () {
+    local name="$1"
+    local flags=(-o "${jsonl_folder}/${name%.xml.bz2}.jsonl.gz" --languages "${languages}")
+    [ -n "${sha256sums}" ] && flags+=(--sha256sums "${sha256sums}")
+    [ "${is_url}" = "no" ] && flags+=(-i "${source_location}/${name}")
+    "${PYTHON}" "${content_export}" is-current "${flags[@]}"
+}
+export -f part_is_current
+
 extract_one () {
     set -euo pipefail
     local name="$1"
     local out="${jsonl_folder}/${name%.xml.bz2}.jsonl.gz"
     local part
 
-    if "${PYTHON}" "${content_export}" is-current -o "${out}" --languages "${languages}"
+    if part_is_current "${name}"
     then
         echo "[extract] ${name}: up to date, skipping"
         return 0
@@ -138,7 +151,7 @@ fi
 missing=0
 while IFS= read -r name
 do
-    if ! "${PYTHON}" "${content_export}" is-current -o "${jsonl_folder}/${name%.xml.bz2}.jsonl.gz" --languages "${languages}"
+    if ! part_is_current "${name}"
     then
         echo "[extract] missing or outdated JSONL for ${name}" >&2
         missing=$((missing + 1))

@@ -169,13 +169,17 @@ bash recipes/paranames_content_export.sh <parts_dir_or_url_base> <output_folder>
   `<url_base>/SHA256SUMS`; every part is checked against it.
 - Intermediate files go to `<output_folder>/intermediate` by default. A part
   whose JSONL file exists and was extracted with the same `languages` selection
-  is skipped, so a rerun with the same arguments resumes. A part extracted with
-  a different selection is extracted again (the selection is stored in
-  `<part>.jsonl.gz.meta.json`).
+  from the same part is skipped, so a rerun with the same arguments resumes. The
+  part is identified by its SHA-256 from `SHA256SUMS` when one is given, else by
+  the size and mtime of the local part. A part extracted with a different
+  selection, or from a different part file with the same name (another dump
+  date), is extracted again. These values are stored in
+  `<part>.jsonl.gz.meta.json`.
 - The run stops with a non-zero exit code when any part fails (download error,
   SHA-256 mismatch, unreadable bzip2 or XML, invalid item JSON, or a part where
-  no item could be read), and before `types` when the number of up-to-date JSONL
-  files differs from the number of parts.
+  no item could be read), before `types` when the number of up-to-date JSONL
+  files differs from the number of parts, and in `dump` when no entity gets a
+  type. A part with no item pages only logs a warning.
 - Environment variables: `languages` (default `en`), `mul_fallback` (default `en`),
   `should_keep_intermediate_files` (default `no`; when `no`, the intermediate
   folder is deleted after a successful run), `intermediate_output_folder`,

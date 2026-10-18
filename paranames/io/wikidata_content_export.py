@@ -277,7 +277,7 @@ class ExtractError(Exception):
 # Sidecar with the extract settings (``<output>.meta.json``)
 # ---------------------------------------------------------------------------
 
-META_FORMAT_VERSION = 1
+META_FORMAT_VERSION = 2
 
 
 def language_key(languages: str) -> str:
@@ -298,17 +298,52 @@ def read_meta(output_path: str) -> Optional[dict]:
         return None
 
 
-def extract_is_current(output_path: str, languages: str) -> bool:
-    """True when ``output_path`` exists and was extracted with the same
-    language selection (the ``mul`` fallback is applied in ``dump`` only;
-    ``extract`` always keeps ``en`` and ``mul``, so it does not matter here)."""
+def part_fingerprint(part_path: str) -> Dict[str, int]:
+    st = os.stat(part_path)
+    return {"part_size": st.st_size, "part_mtime_ns": st.st_mtime_ns}
+
+
+def extract_is_current(
+    output_path: str,
+    languages: str,
+    part_path: Optional[str] = None,
+    sha256sums: Optional[str] = None,
+) -> bool:
+    """True when ``output_path`` exists, was extracted with the same language
+    selection, and comes from the same part.
+
+    The part is identified by its SHA-256 when ``sha256sums`` is given (the
+    recorded hash must equal the listed one; the part file need not exist, so
+    a URL run can check before downloading), else by the size and mtime of
+    ``part_path``. With neither, the part is not checked.
+
+    The ``mul`` fallback is applied in ``dump`` only; ``extract`` always keeps
+    ``en`` and ``mul``, so it does not matter here."""
     meta = read_meta(output_path)
-    return (
+    if not (
         os.path.exists(output_path)
         and meta is not None
         and meta.get("format_version") == META_FORMAT_VERSION
         and meta.get("languages") == language_key(languages)
-    )
+    ):
+        return False
+
+    if sha256sums:
+        name = meta.get("part")
+        if part_path and os.path.basename(part_path) != name:
+            return False
+        try:
+            return meta.get("sha256") == expected_sha256(sha256sums, name)
+        except ChecksumError:
+            return False
+
+    if part_path:
+        if not os.path.exists(part_path):
+            return False
+        fp = part_fingerprint(part_path)
+        return all(meta.get(k) == v for k, v in fp.items())
+
+    return True
 
 
 def selection_covers(extracted: str, requested: str) -> bool:
@@ -461,7 +496,14 @@ def extract_part(
 
         if stats["pages_seen"] == 0:
             raise ExtractError(f"{part_path}: no <page> elements")
-        if stats["item_pages"] > 0 and stats["items_parsed"] == 0:
+        if stats["item_pages"] == 0:
+            print(
+                f"[extract {os.path.basename(part_path)}] WARNING: no item pages "
+                f"({stats['pages_seen']} pages seen)",
+                file=sys.stderr,
+            )
+        # Redirect item pages count as read: a part may hold only redirects.
+        elif stats["items_parsed"] + stats["skipped_redirect"] == 0:
             raise ExtractError(
                 f"{part_path}: {stats['item_pages']} item pages but no item could be read"
             )
@@ -478,6 +520,8 @@ def extract_part(
             "format_version": META_FORMAT_VERSION,
             "languages": language_key(languages),
             "part": os.path.basename(part_path),
+            "sha256": reader.hash.hexdigest(),
+            **part_fingerprint(part_path),
             "stats": dict(stats),
         }
         with open(meta_path(output_path), "wb") as fmeta:
@@ -726,6 +770,13 @@ def dump_tsv(
             w.close()
         sitelinks_f.close()
 
+    if stats["typed_entities"] == 0:
+        raise click.ClickException(
+            f"No typed entities in {input_dir} (languages={languages}, "
+            f"mul_fallback={mul_fallback!r}); the TSV would be empty. "
+            "Check the parts, the closures and the language selection."
+        )
+
     combine_type_files(output_dir, os.path.join(output_dir, "combined.tsv"))
     return stats
 
@@ -797,7 +848,7 @@ def cli() -> None:
 )
 def extract(input_file, output_file, sha256sums, languages, resume) -> None:
     """Stream one .xml.bz2 part into a gzip JSONL file."""
-    if resume and extract_is_current(output_file, languages):
+    if resume and extract_is_current(output_file, languages, input_file, sha256sums):
         print(
             f"[extract {os.path.basename(input_file)}] up to date, skipped",
             file=sys.stderr,
@@ -812,11 +863,18 @@ def extract(input_file, output_file, sha256sums, languages, resume) -> None:
 
 @cli.command("is-current")
 @click.option("--output-file", "-o", required=True)
+@click.option(
+    "--input-file", "-i", default=None, help="Local part (size and mtime are compared)"
+)
+@click.option(
+    "--sha256sums", default=None, help="SHA256SUMS file (the listed hash is compared)"
+)
 @languages_option
-def is_current(output_file, languages) -> None:
-    """Exit 0 when OUTPUT_FILE exists and was extracted with the same
-    language selection, else exit 1."""
-    sys.exit(0 if extract_is_current(output_file, languages) else 1)
+def is_current(output_file, input_file, sha256sums, languages) -> None:
+    """Exit 0 when OUTPUT_FILE exists, was extracted with the same language
+    selection and from the same part, else exit 1."""
+    ok = extract_is_current(output_file, languages, input_file, sha256sums)
+    sys.exit(0 if ok else 1)
 
 
 @cli.command()
