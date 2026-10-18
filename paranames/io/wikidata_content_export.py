@@ -96,42 +96,61 @@ def _as_dict(value) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+# Id prefix per Wikibase entity type, to rebuild an id from ``numeric-id``.
+ENTITY_TYPE_PREFIX = {"item": "Q", "property": "P", "lexeme": "L"}
+
+
+class UnresolvedId(Exception):
+    """A datavalue is present but no entity id can be read or rebuilt."""
+
+
 def _entity_id(datavalue_value) -> str:
-    """Item id of a wikibase-entityid value.
+    """Entity id of a wikibase-entityid value.
 
-    Raises KeyError when there is no id, like the upstream lookup
-    ``iof["mainsnak"]["datavalue"]["value"]["id"]``. Older stored revisions
-    can carry only ``numeric-id``; the JSON dumps that upstream reads always
-    print ``id``, so the same id is rebuilt here."""
+    Older stored revisions can carry only ``numeric-id`` and ``entity-type``;
+    the JSON dumps that upstream reads always print ``id``, so the same id is
+    rebuilt here. Raises UnresolvedId when neither works."""
 
-    if not isinstance(datavalue_value, dict):
-        raise KeyError("id")
+    if isinstance(datavalue_value, dict):
+        if "id" in datavalue_value:
+            return datavalue_value["id"]
 
-    if "id" in datavalue_value:
-        return datavalue_value["id"]
+        prefix = ENTITY_TYPE_PREFIX.get(datavalue_value.get("entity-type"))
+        if prefix and "numeric-id" in datavalue_value:
+            return f"{prefix}{datavalue_value['numeric-id']}"
 
-    if datavalue_value.get("entity-type") == "item" and "numeric-id" in datavalue_value:
-        return f"Q{datavalue_value['numeric-id']}"
-
-    raise KeyError("id")
+    raise UnresolvedId(repr(datavalue_value)[:200])
 
 
-def parse_p31(claims: dict) -> List[str]:
+def parse_p31(claims: dict, stats: Optional[Counter] = None) -> List[str]:
     """P31 values as ParaNames reads them (paranames/util/wikidata.py,
     WikidataRecord.parse_instance_of): every claim of every rank, including
     deprecated ones. If one claim has no datavalue (novalue/somevalue), the
     upstream code hits a KeyError and the whole set becomes empty, so the
-    entity is dropped. This is kept on purpose for fidelity."""
+    entity is dropped. This is kept on purpose for fidelity.
 
-    try:
-        return sorted(
-            {_entity_id(c["mainsnak"]["datavalue"]["value"]) for c in claims["P31"]}
-        )
-    except (KeyError, TypeError):
+    A value whose id cannot be read or rebuilt is left out and counted in
+    ``stats["p31_values_unresolved"]``; the other values are kept."""
+
+    statements = claims.get("P31")
+    if not isinstance(statements, list):
         return []
 
+    values = set()
+    for c in statements:
+        try:
+            value = c["mainsnak"]["datavalue"]["value"]
+        except (KeyError, TypeError):
+            return []
+        try:
+            values.add(_entity_id(value))
+        except UnresolvedId:
+            if stats is not None:
+                stats["p31_values_unresolved"] += 1
+    return sorted(values)
 
-def parse_p279_truthy(claims: dict) -> List[str]:
+
+def parse_p279_truthy(claims: dict, stats: Optional[Counter] = None) -> List[str]:
     """Truthy P279 values, like ``wdt:P279`` in WDQS: the claims of the best
     rank (preferred if any preferred claim exists, else normal; never
     deprecated). The best rank is chosen over all claims, value or not; only
@@ -157,28 +176,42 @@ def parse_p279_truthy(claims: dict) -> List[str]:
         if not isinstance(claim, dict) or claim.get("rank", "normal") != best:
             continue
         try:
-            values.add(_entity_id(claim["mainsnak"]["datavalue"]["value"]))
+            value = claim["mainsnak"]["datavalue"]["value"]
         except (KeyError, TypeError):
             continue
+        try:
+            values.add(_entity_id(value))
+        except UnresolvedId:
+            if stats is not None:
+                stats["p279_values_unresolved"] += 1
 
     return sorted(values)
 
 
-def item_to_record(item: dict, keep_label_languages: Optional[Set[str]] = None) -> dict:
-    """Compact record for the per-part JSONL.
+def item_to_record(
+    item: dict,
+    keep_label_languages: Optional[Set[str]] = None,
+    stats: Optional[Counter] = None,
+) -> Optional[dict]:
+    """Compact record for the per-part JSONL, or None for an unusable item.
 
     Labels and sitelinks are kept only for candidate items (an ``en`` or
-    ``mul`` label and a non-empty P31). The other items can never be output;
-    they keep ``id``, ``p31`` and ``p279`` because P279 builds the closures."""
+    ``mul`` label and a non-empty P31). A non-candidate item with P279 edges
+    is kept with empty labels, because P279 builds the class closures. A
+    non-candidate item without P279 edges can neither be output nor shape the
+    closures, so it is skipped (None)."""
 
     claims = _as_dict(item.get("claims"))
-    p31 = parse_p31(claims)
-    p279 = parse_p279_truthy(claims)
+    p31 = parse_p31(claims, stats)
+    p279 = parse_p279_truthy(claims, stats)
     raw_labels = _as_dict(item.get("labels"))
 
     labels: Dict[str, str] = {}
     sitelinks: Dict[str, str] = {}
     is_candidate = bool(p31) and (ENGLISH in raw_labels or MUL in raw_labels)
+
+    if not is_candidate and not p279:
+        return None
 
     if is_candidate:
         for lang, d in raw_labels.items():
@@ -234,6 +267,58 @@ class HashingReader:
 
 class ChecksumError(Exception):
     pass
+
+
+class ExtractError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Sidecar with the extract settings (``<output>.meta.json``)
+# ---------------------------------------------------------------------------
+
+META_FORMAT_VERSION = 1
+
+
+def language_key(languages: str) -> str:
+    """Normal form of a language selection: ``all`` or sorted codes."""
+    selected = parse_language_list(languages)
+    return ALL_LANGUAGES if selected is None else ",".join(sorted(selected))
+
+
+def meta_path(output_path: str) -> str:
+    return output_path + ".meta.json"
+
+
+def read_meta(output_path: str) -> Optional[dict]:
+    try:
+        with open(meta_path(output_path), "rb") as fin:
+            return orjson.loads(fin.read())
+    except (OSError, orjson.JSONDecodeError):
+        return None
+
+
+def extract_is_current(output_path: str, languages: str) -> bool:
+    """True when ``output_path`` exists and was extracted with the same
+    language selection (the ``mul`` fallback is applied in ``dump`` only;
+    ``extract`` always keeps ``en`` and ``mul``, so it does not matter here)."""
+    meta = read_meta(output_path)
+    return (
+        os.path.exists(output_path)
+        and meta is not None
+        and meta.get("format_version") == META_FORMAT_VERSION
+        and meta.get("languages") == language_key(languages)
+    )
+
+
+def selection_covers(extracted: str, requested: str) -> bool:
+    have = parse_language_list(extracted)
+    want = parse_language_list(requested)
+    if have is None:
+        return True
+    if want is None:
+        return False
+    return want <= have
 
 
 def expected_sha256(sums_file: str, part_path: str) -> str:
@@ -301,6 +386,12 @@ def iter_pages(
             root.clear()
 
 
+def _remove_if_exists(*paths: str) -> None:
+    for path in paths:
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def extract_part(
     part_path: str,
     output_path: str,
@@ -313,6 +404,9 @@ def extract_part(
     existing output file is always complete."""
 
     keep = labels_to_keep_in_extract(parse_language_list(languages))
+    for path in (output_path, meta_path(output_path)):
+        if os.path.exists(path):
+            os.remove(path)
     expected = expected_sha256(sha256sums, part_path) if sha256sums else None
     stats: Counter = Counter()
     tmp_path = output_path + ".tmp"
@@ -342,9 +436,10 @@ def extract_part(
                     continue
                 try:
                     item = orjson.loads(text)
-                except orjson.JSONDecodeError:
-                    stats["skipped_json_error"] += 1
-                    continue
+                except orjson.JSONDecodeError as e:
+                    raise ExtractError(
+                        f"{part_path}: invalid JSON in page {title!r}: {e}"
+                    )
                 if not isinstance(item, dict) or "redirect" in item:
                     stats["skipped_redirect"] += 1
                     continue
@@ -352,13 +447,24 @@ def extract_part(
                     stats["skipped_not_item"] += 1
                     continue
 
-                record = item_to_record(item, keep)
+                stats["items_parsed"] += 1
+                record = item_to_record(item, keep, stats)
+                if record is None:
+                    stats["skipped_unusable"] += 1
+                    continue
                 fout.write(orjson.dumps(record) + b"\n")
                 stats["items_written"] += 1
                 if record["labels"]:
                     stats["candidate_items"] += 1
 
         reader.drain()
+
+        if stats["pages_seen"] == 0:
+            raise ExtractError(f"{part_path}: no <page> elements")
+        if stats["item_pages"] > 0 and stats["items_parsed"] == 0:
+            raise ExtractError(
+                f"{part_path}: {stats['item_pages']} item pages but no item could be read"
+            )
 
         if expected is not None:
             actual = reader.hash.hexdigest()
@@ -368,10 +474,20 @@ def extract_part(
                 )
             stats["sha256_verified"] = 1
 
+        meta = {
+            "format_version": META_FORMAT_VERSION,
+            "languages": language_key(languages),
+            "part": os.path.basename(part_path),
+            "stats": dict(stats),
+        }
+        with open(meta_path(output_path), "wb") as fmeta:
+            fmeta.write(orjson.dumps(meta))
         os.replace(tmp_path, output_path)
+    except (OSError, EOFError, ET.ParseError) as e:
+        _remove_if_exists(tmp_path, meta_path(output_path))
+        raise ExtractError(f"{part_path}: extract failed: {e}") from e
     except BaseException:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        _remove_if_exists(tmp_path, meta_path(output_path))
         raise
     finally:
         reader.close()
@@ -384,11 +500,31 @@ def extract_part(
 # ---------------------------------------------------------------------------
 
 
-def iter_records(input_dir: str) -> Iterator[dict]:
+def jsonl_files(input_dir: str) -> List[str]:
     files = sorted(glob.glob(os.path.join(input_dir, "*.jsonl.gz")))
     if not files:
         raise click.ClickException(f"No *.jsonl.gz files in {input_dir}")
-    for path in files:
+    return files
+
+
+def check_extract_languages(input_dir: str, languages: str) -> None:
+    """Fail when a JSONL file was extracted with a selection that does not
+    cover ``languages`` (its labels would be missing from the output)."""
+    for path in jsonl_files(input_dir):
+        meta = read_meta(path)
+        if meta is None:
+            raise click.ClickException(
+                f"{path}: no {meta_path(path)}; run extract again"
+            )
+        if not selection_covers(meta.get("languages", ""), languages):
+            raise click.ClickException(
+                f"{path} was extracted with --languages {meta.get('languages')}, "
+                f"which does not cover --languages {languages}; run extract again"
+            )
+
+
+def iter_records(input_dir: str) -> Iterator[dict]:
+    for path in jsonl_files(input_dir):
         with gzip.open(path, "rb") as fin:
             for line in fin:
                 if line.strip():
@@ -531,7 +667,13 @@ def dump_tsv(
 ) -> Counter:
     selected = parse_language_list(languages)
     excluded = read_exclude_file(exclude_file)
-    fallback = parse_language_list(mul_fallback) or set()
+    fallback = parse_language_list(mul_fallback)
+    if fallback is None:
+        raise click.BadParameter(
+            "'all' is not allowed; give a comma-separated list of languages, or '' for none",
+            param_hint="--mul-fallback",
+        )
+    check_extract_languages(input_dir, languages)
     closures = read_closures(closures_dir)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -589,9 +731,10 @@ def dump_tsv(
 
 
 def combine_type_files(type_dir: str, output_path: str) -> None:
-    """Same result as ``xsv cat rows -d"\\t" LOC.tsv ORG.tsv PER.tsv |
+    """Stands in for ``xsv cat rows -d"\\t" LOC.tsv ORG.tsv PER.tsv |
     xsv fmt -t"\\t"`` in recipes/dump.sh: one header, the files in glob
-    (alphabetical) order, LF line endings, minimal quoting."""
+    (alphabetical) order, LF line endings, Python csv minimal quoting.
+    The output was not compared byte for byte with real xsv output."""
 
     with open(output_path, "w", encoding="utf-8", newline="") as fout:
         writer = csv.writer(fout, delimiter="\t", lineterminator="\n")
@@ -647,13 +790,33 @@ def cli() -> None:
     help="SHA256SUMS file to verify the part against",
 )
 @languages_option
-def extract(input_file, output_file, sha256sums, languages) -> None:
+@click.option(
+    "--resume",
+    is_flag=True,
+    help="Skip the part when its output exists with the same language selection",
+)
+def extract(input_file, output_file, sha256sums, languages, resume) -> None:
     """Stream one .xml.bz2 part into a gzip JSONL file."""
+    if resume and extract_is_current(output_file, languages):
+        print(
+            f"[extract {os.path.basename(input_file)}] up to date, skipped",
+            file=sys.stderr,
+        )
+        return
     try:
         stats = extract_part(input_file, output_file, sha256sums, languages)
-    except ChecksumError as e:
+    except (ChecksumError, ExtractError) as e:
         raise click.ClickException(str(e))
     _log_stats(f"extract {os.path.basename(input_file)}", stats)
+
+
+@cli.command("is-current")
+@click.option("--output-file", "-o", required=True)
+@languages_option
+def is_current(output_file, languages) -> None:
+    """Exit 0 when OUTPUT_FILE exists and was extracted with the same
+    language selection, else exit 1."""
+    sys.exit(0 if extract_is_current(output_file, languages) else 1)
 
 
 @cli.command()

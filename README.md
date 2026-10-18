@@ -167,10 +167,18 @@ bash recipes/paranames_content_export.sh <parts_dir_or_url_base> <output_folder>
   URL of the `xml/bzip2/` folder. With a URL, each worker downloads one part,
   extracts it and deletes it. For a URL, `sha256sums` defaults to
   `<url_base>/SHA256SUMS`; every part is checked against it.
-- A part whose JSONL file already exists is skipped, so an interrupted run can be
-  resumed with the same `intermediate_output_folder`.
+- Intermediate files go to `<output_folder>/intermediate` by default. A part
+  whose JSONL file exists and was extracted with the same `languages` selection
+  is skipped, so a rerun with the same arguments resumes. A part extracted with
+  a different selection is extracted again (the selection is stored in
+  `<part>.jsonl.gz.meta.json`).
+- The run stops with a non-zero exit code when any part fails (download error,
+  SHA-256 mismatch, unreadable bzip2 or XML, invalid item JSON, or a part where
+  no item could be read), and before `types` when the number of up-to-date JSONL
+  files differs from the number of parts.
 - Environment variables: `languages` (default `en`), `mul_fallback` (default `en`),
-  `should_keep_intermediate_files` (default `no`), `intermediate_output_folder`,
+  `should_keep_intermediate_files` (default `no`; when `no`, the intermediate
+  folder is deleted after a successful run), `intermediate_output_folder`,
   `should_disambiguate_types` and `should_collapse_languages` (default `no`, as in
   `recipes/dump.sh`), `PYTHON`.
 
@@ -183,13 +191,17 @@ python paranames/io/wikidata_content_export.py types -i <jsonl_folder> -o <closu
 python paranames/io/wikidata_content_export.py dump -i <jsonl_folder> -c <closures_folder> -o <tsv_folder> [--languages en] [--mul-fallback en]
 ```
 
-`dump` writes `PER.tsv`, `LOC.tsv`, `ORG.tsv` and `combined.tsv` (the same
-columns, header and quoting as the file that `recipes/dump.sh` gives to
-`postprocess.py`), and `sitelinks.tsv` (`wikidata_id`, `site`) for the typed
+`dump` writes `PER.tsv`, `LOC.tsv`, `ORG.tsv` and `combined.tsv`, and `sitelinks.tsv` (`wikidata_id`, `site`) for the typed
 entities. After that, the recipe runs `postprocess.py`,
 `script_standardization.py` and `separate_by_language.py` with the same
 arguments as `recipes/dump.sh`. The closures and `sitelinks.tsv` are copied to
 `<output_folder>/extra_data/`.
+
+`combined.tsv` has the columns and header of the file that `recipes/dump.sh`
+gives to `postprocess.py`, with one header line, the type files in the order
+LOC, ORG, PER, LF line ends and Python `csv` minimal quoting. It replaces the
+`xsv cat rows | xsv fmt` step of `recipes/dump.sh`; it was not compared byte for
+byte with real `xsv` output.
 
 ### Languages
 
@@ -203,8 +215,9 @@ languages=all bash recipes/paranames_content_export.sh ...
 ```
 
 The selection is applied in `extract` already, so the intermediate JSONL files
-keep only the selected labels plus `en` and `mul`. A JSONL set made with a
-smaller selection cannot be dumped with a larger one; run `extract` again.
+keep only the selected labels plus `en` and `mul`. `dump` stops with an error
+when a JSONL file was extracted with a selection that does not cover the
+requested one; the recipe then extracts that part again.
 
 ### Differences from ParaNames v2024.05.07.0
 
@@ -212,8 +225,9 @@ smaller selection cannot be dumped with a larger one; run `extract` again.
   `en` label but a `mul` label uses the `mul` value as its English name (the
   `eng` column) and gets an `en` row with that value. A `mul` label is never
   output as a language row of its own. This is controlled by `mul_fallback`
-  (`--mul-fallback`, default `en`; an empty value turns it off). Other languages
-  can be added to that list, but no other language uses `mul` by default.
+  (`--mul-fallback`, default `en`; an empty value turns it off; `all` is
+  rejected). Other languages can be added to that list, but no other language
+  uses `mul` by default.
 - **Subclass closure from the dump.** Upstream gets the subclasses of LOC
   (`Q82794`) and ORG (`Q43229`) from a live WDQS query (`wdt:P279*`). Here they
   are computed from the truthy P279 statements in the same export (preferred
@@ -233,4 +247,6 @@ are given here; check which one applies to your use.
 ### Resources
 
 Disk: about one part per worker (for a URL base), plus the per-part JSONL files
-and the TSV outputs. No full run has been measured yet.
+and the TSV outputs, all under `<output_folder>/intermediate` by default (set
+`intermediate_output_folder` to put them elsewhere). If a run fails, this folder
+stays, so a rerun can resume. No full run has been measured yet.

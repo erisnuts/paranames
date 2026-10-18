@@ -17,7 +17,8 @@ usage () {
     echo "  SHA256SUMS             local path or URL; for a URL base, defaults to <URL_BASE>/SHA256SUMS"
     echo
     echo "Environment: languages=en (comma-separated or 'all'), mul_fallback=en,"
-    echo "             should_keep_intermediate_files=no, intermediate_output_folder=, PYTHON=python"
+    echo "             should_keep_intermediate_files=no,"
+    echo "             intermediate_output_folder=<OUTPUT_FOLDER>/intermediate, PYTHON=python"
 }
 
 [ $# -lt 2 ] && usage && exit 1
@@ -41,13 +42,9 @@ export PYTHONPATH="$(pwd)${PYTHONPATH:+:${PYTHONPATH}}"
 content_export="paranames/io/wikidata_content_export.py"
 extra_data_folder="${output_folder}/extra_data"
 
-if [ "${should_keep_intermediate_files}" = "yes" ]
-then
-    intermediate_output_folder="${output_folder}/intermediate"
-elif [ -z "${intermediate_output_folder:-}" ]
-then
-    intermediate_output_folder=$(mktemp -d /tmp/paranames_intermediate_files_XXXXX)
-fi
+# Default under the output folder, so a rerun with the same arguments resumes
+# (parts whose JSONL is up to date are not extracted again).
+intermediate_output_folder="${intermediate_output_folder:-${output_folder}/intermediate}"
 echo "Intermediate files: ${intermediate_output_folder}"
 
 jsonl_folder="${intermediate_output_folder}/jsonl"
@@ -91,20 +88,26 @@ esac
 
 ## Step 1: extract every part (one part per worker)
 extract_one () {
+    set -euo pipefail
     local name="$1"
     local out="${jsonl_folder}/${name%.xml.bz2}.jsonl.gz"
     local part
 
-    if [ -f "${out}" ]
+    if "${PYTHON}" "${content_export}" is-current -o "${out}" --languages "${languages}"
     then
-        echo "[extract] ${name}: already done, skipping"
+        echo "[extract] ${name}: up to date, skipping"
         return 0
     fi
 
     if [ "${is_url}" = "yes" ]
     then
         part="${download_folder}/${name}"
-        curl -fsSL --retry 5 --retry-delay 10 -o "${part}.partial" "${source_location}/${name}"
+        if ! curl -fsSL --retry 5 --retry-delay 10 -o "${part}.partial" "${source_location}/${name}"
+        then
+            echo "[extract] ${name}: download failed" >&2
+            rm -f "${part}.partial"
+            return 1
+        fi
         mv "${part}.partial" "${part}"
     else
         part="${source_location}/${name}"
@@ -125,7 +128,33 @@ export -f extract_one
 export jsonl_folder download_folder source_location is_url sha256sums languages PYTHON content_export
 
 echo "[1/6] Extract ${n_parts} parts with ${n_workers} workers..."
-tr '\n' '\0' < "${part_list}" | xargs -0 -n 1 -P "${n_workers}" bash -c 'extract_one "$1"' _
+# xargs exits non-zero when any job fails; set -e and pipefail stop the run.
+if ! tr '\n' '\0' < "${part_list}" | xargs -0 -n 1 -P "${n_workers}" bash -c 'extract_one "$1"' _
+then
+    echo "[extract] at least one part failed; stopping (rerun to resume)" >&2
+    exit 1
+fi
+
+missing=0
+while IFS= read -r name
+do
+    if ! "${PYTHON}" "${content_export}" is-current -o "${jsonl_folder}/${name%.xml.bz2}.jsonl.gz" --languages "${languages}"
+    then
+        echo "[extract] missing or outdated JSONL for ${name}" >&2
+        missing=$((missing + 1))
+    fi
+done < "${part_list}"
+if [ "${missing}" -ne 0 ]
+then
+    echo "[extract] ${missing} of ${n_parts} parts have no up-to-date JSONL; stopping" >&2
+    exit 1
+fi
+n_jsonl=$(find "${jsonl_folder}" -maxdepth 1 -name '*.jsonl.gz' | wc -l | tr -d ' ')
+if [ "${n_jsonl}" -ne "${n_parts}" ]
+then
+    echo "[extract] ${jsonl_folder} has ${n_jsonl} JSONL files for ${n_parts} parts; remove the extra files" >&2
+    exit 1
+fi
 
 ## Step 2: P279 closures from the dump itself
 echo "[2/6] Compute LOC/ORG subclass closures..."

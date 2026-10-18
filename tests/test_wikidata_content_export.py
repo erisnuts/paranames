@@ -3,6 +3,7 @@ import csv
 import gzip
 import hashlib
 import json
+from collections import Counter
 import os
 import subprocess
 import sys
@@ -271,7 +272,10 @@ def test_extract_skips_and_counts(tmp_path, parts_dir):
     assert stats["skipped_namespace"] == 2
     assert stats["skipped_model"] == 1
     assert stats["item_pages"] == len(PART2)
-    assert stats["items_written"] == len(PART2)
+    assert stats["items_parsed"] == len(PART2)
+    # Q12 (P31 novalue) and Q19 (no en/mul label) have no P279 edge: skipped
+    assert stats["skipped_unusable"] == 2
+    assert stats["items_written"] == len(PART2) - 2
     with gzip.open(out, "rb") as f:
         records = [orjson.loads(l) for l in f]
     ids = [r["id"] for r in records]
@@ -282,8 +286,7 @@ def test_extract_skips_and_counts(tmp_path, parts_dir):
     assert q10["sitelinks"] == {"enwiki": "Ada Lovelace", "dewiki": "Ada Lovelace"}
     q11 = next(r for r in records if r["id"] == "Q11")
     assert set(q11["labels"]) == {"mul"}
-    q12 = next(r for r in records if r["id"] == "Q12")
-    assert q12["p31"] == [] and q12["labels"] == {}
+    assert "Q12" not in ids and "Q19" not in ids
 
 
 def test_extract_all_languages_keeps_everything(tmp_path, parts_dir):
@@ -495,22 +498,26 @@ def _icu_available():
     return True
 
 
-def _run_recipe(tmp_path, source, extra_env=None, sums=None):
+def _run_recipe(tmp_path, source, extra_env=None, sums=None, expect_ok=True):
+    """Run the recipe; the intermediate folder is the default
+    ``<output>/intermediate``."""
     out = tmp_path / "release"
-    env = {
-        **os.environ,
-        "PYTHON": sys.executable,
-        "intermediate_output_folder": str(tmp_path / "work"),
-        "should_keep_intermediate_files": "no",
-        **(extra_env or {}),
-    }
+    env = {k: v for k, v in os.environ.items() if k != "intermediate_output_folder"}
+    env.update({"PYTHON": sys.executable, "should_keep_intermediate_files": "no"})
+    env.update(extra_env or {})
     args = ["bash", "recipes/paranames_content_export.sh", source, str(out), "2"]
     if sums:
         args.append(sums)
     result = subprocess.run(
         args, cwd=REPO_ROOT, env=env, capture_output=True, text=True
     )
-    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
+    if expect_ok:
+        assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
+    else:
+        assert result.returncode != 0, result.stdout[-3000:] + result.stderr[-3000:]
+        # the run stopped before types/dump/postprocess
+        assert "[2/6]" not in result.stdout
+        assert not (out / "combined" / "paranames.tsv").exists()
     return out, result
 
 
@@ -522,7 +529,7 @@ def test_recipe_local_parts_english(tmp_path, parts_dir):
     assert ("Q11", "Douglas Adams") in {(r["wikidata_id"], r["eng"]) for r in rows}
     assert (out / "en" / "paranames_en.tsv").exists()
     assert (out / "extra_data" / "sitelinks.tsv").exists()
-    assert not (tmp_path / "work").exists()
+    assert not (out / "intermediate").exists()
 
 
 @pytest.mark.skipif(not _icu_available(), reason="PyICU not installed")
@@ -560,3 +567,235 @@ def test_recipe_url_base_with_checksums(tmp_path, parts_dir):
     # downloaded parts are deleted after extraction
     assert list((out / "intermediate" / "download").glob("*.xml.bz2")) == []
     assert len(list((out / "intermediate" / "jsonl").glob("*.jsonl.gz"))) == 2
+
+
+@pytest.mark.skipif(not _icu_available(), reason="PyICU not installed")
+def test_recipe_fails_on_corrupt_part(tmp_path, parts_dir):
+    (parts_dir / "part-3.xml.bz2").write_bytes(b"this is not bzip2 data")
+    _, result = _run_recipe(tmp_path, str(parts_dir), expect_ok=False)
+    assert "part-3.xml.bz2" in result.stderr
+
+
+@pytest.mark.skipif(not _icu_available(), reason="PyICU not installed")
+def test_recipe_fails_on_sha256_mismatch(tmp_path, parts_dir):
+    sums = tmp_path / "SHA256SUMS"
+    lines = []
+    for p in sorted(parts_dir.glob("*.xml.bz2")):
+        digest = hashlib.sha256(p.read_bytes()).hexdigest()
+        if p.name == "part-2.xml.bz2":
+            digest = "0" * 64
+        lines.append(f"{digest}  {p.name}\n")
+    sums.write_text("".join(lines))
+    _, result = _run_recipe(tmp_path, str(parts_dir), sums=str(sums), expect_ok=False)
+    assert "SHA-256 mismatch" in result.stderr
+
+
+@pytest.mark.skipif(not _icu_available(), reason="PyICU not installed")
+def test_recipe_fails_on_failed_download(tmp_path, parts_dir):
+    import functools
+    import http.server
+    import threading
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if "part-2" in self.path:
+                self.send_error(404)
+                return
+            super().do_GET()
+
+        def log_message(self, *a, **k):
+            pass
+
+    sums = tmp_path / "SUMS"
+    sums.write_text(
+        "".join(
+            f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n"
+            for p in sorted(parts_dir.glob("*.xml.bz2"))
+        )
+    )
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), functools.partial(Handler, directory=str(parts_dir))
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}/"
+        out, result = _run_recipe(tmp_path, base, sums=str(sums), expect_ok=False)
+    finally:
+        server.shutdown()
+    assert "download failed" in result.stderr
+    # no .partial left and no failed download renamed to a part
+    assert not (out / "intermediate" / "download" / "part-2.xml.bz2").exists()
+    assert list((out / "intermediate" / "download").glob("*.partial")) == []
+
+
+@pytest.mark.skipif(not _icu_available(), reason="PyICU not installed")
+def test_recipe_rerun_reextracts_on_language_change(tmp_path, parts_dir):
+    keep = {"should_keep_intermediate_files": "yes"}
+    out, _ = _run_recipe(tmp_path, str(parts_dir), extra_env=keep)
+    assert {r["language"] for r in read_tsv(out / "combined" / "paranames.tsv")} == {
+        "en"
+    }
+    assert len(list((out / "intermediate" / "jsonl").glob("*.jsonl.gz"))) == 2
+
+    out, result = _run_recipe(
+        tmp_path, str(parts_dir), extra_env={**keep, "languages": "en,de"}
+    )
+    assert "up to date, skipping" not in result.stdout
+    assert {r["language"] for r in read_tsv(out / "combined" / "paranames.tsv")} == {
+        "en",
+        "de",
+    }
+
+    _, result = _run_recipe(
+        tmp_path, str(parts_dir), extra_env={**keep, "languages": "de,en"}
+    )
+    assert result.stdout.count("up to date, skipping") == 2
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: extract errors, ids, sidecar, --mul-fallback all
+# ---------------------------------------------------------------------------
+
+
+def test_extract_fails_on_invalid_json(tmp_path):
+    part = tmp_path / "bad-json.xml.bz2"
+    write_part(
+        part, [item_page(PART2[0], 1), page("Q77", 0, "wikibase-item", "{not json", 2)]
+    )
+    out = tmp_path / "o.jsonl.gz"
+    with pytest.raises(ce.ExtractError, match="invalid JSON"):
+        ce.extract_part(str(part), str(out))
+    assert not out.exists()
+    r = CliRunner().invoke(ce.cli, ["extract", "-i", str(part), "-o", str(out)])
+    assert r.exit_code != 0
+
+
+def test_extract_fails_when_no_item_read(tmp_path):
+    part = tmp_path / "empty-items.xml.bz2"
+    write_part(
+        part,
+        [
+            page(
+                "Q78",
+                0,
+                "wikibase-item",
+                json.dumps({"type": "property", "id": "P1"}),
+                1,
+            )
+        ],
+    )
+    with pytest.raises(ce.ExtractError, match="no item could be read"):
+        ce.extract_part(str(part), str(tmp_path / "o.jsonl.gz"))
+
+    no_pages = tmp_path / "no-pages.xml.bz2"
+    write_part(no_pages, [])
+    with pytest.raises(ce.ExtractError, match="no <page>"):
+        ce.extract_part(str(no_pages), str(tmp_path / "o2.jsonl.gz"))
+
+
+def test_numeric_id_rebuilt_by_entity_type():
+    def numeric_only(entity_type, n):
+        return {
+            "mainsnak": {
+                "snaktype": "value",
+                "datavalue": {"value": {"entity-type": entity_type, "numeric-id": n}},
+            },
+            "rank": "normal",
+        }
+
+    stats = Counter()
+    claims = {
+        "P31": [
+            numeric_only("item", 5),
+            numeric_only("property", 7),
+            numeric_only("lexeme", 9),
+            numeric_only("form", 3),  # no prefix known: cannot be rebuilt
+        ]
+    }
+    assert ce.parse_p31(claims, stats) == ["L9", "P7", "Q5"]
+    assert stats["p31_values_unresolved"] == 1
+
+
+def test_mul_fallback_all_rejected(tmp_path, parts_dir):
+    jsonl, closures, _, _, _ = run_pipeline(tmp_path, parts_dir)
+    r = CliRunner().invoke(
+        ce.cli,
+        [
+            "dump",
+            "-i",
+            str(jsonl),
+            "-c",
+            str(closures),
+            "-o",
+            str(tmp_path / "x"),
+            "--mul-fallback",
+            "all",
+        ],
+    )
+    assert r.exit_code != 0
+    assert "'all' is not allowed" in r.output
+
+
+def test_language_sidecar(tmp_path, parts_dir):
+    part = parts_dir / "part-2.xml.bz2"
+    jsonl = tmp_path / "j"
+    jsonl.mkdir()
+    out = jsonl / "part-2.jsonl.gz"
+    ce.extract_part(str(part), str(out), languages="en")
+    meta = ce.read_meta(str(out))
+    assert meta["languages"] == "en" and meta["part"] == "part-2.xml.bz2"
+    assert ce.extract_is_current(str(out), "en")
+    assert not ce.extract_is_current(str(out), "de,en")
+
+    runner = CliRunner()
+    r = runner.invoke(ce.cli, ["is-current", "-o", str(out), "--languages", "en,de"])
+    assert r.exit_code == 1
+
+    # dump with a larger selection than the extract fails clearly
+    ce.build_closures(str(jsonl), str(tmp_path / "c"))
+    r = runner.invoke(
+        ce.cli,
+        [
+            "dump",
+            "-i",
+            str(jsonl),
+            "-c",
+            str(tmp_path / "c"),
+            "-o",
+            str(tmp_path / "o"),
+            "--languages",
+            "en,de",
+        ],
+    )
+    assert r.exit_code != 0 and "does not cover" in r.output
+
+    # --resume re-extracts on a different selection, skips on the same one
+    r = runner.invoke(
+        ce.cli,
+        [
+            "extract",
+            "-i",
+            str(part),
+            "-o",
+            str(out),
+            "--languages",
+            "en,de",
+            "--resume",
+        ],
+    )
+    assert r.exit_code == 0 and "up to date" not in r.output
+    assert ce.read_meta(str(out))["languages"] == "de,en"
+    r = runner.invoke(
+        ce.cli,
+        [
+            "extract",
+            "-i",
+            str(part),
+            "-o",
+            str(out),
+            "--languages",
+            "de,en",
+            "--resume",
+        ],
+    )
+    assert r.exit_code == 0 and "up to date" in r.output
